@@ -1,9 +1,11 @@
 """
-栽培試験 GLM解析プラットフォーム (改善版+機能強化版)
-主な機能追加:
-  - ファイルアップロード機能 (CSV/Excel対応, Shift-JIS自動フォールバック)
-  - 過分散 (Overdispersion) の自動計算と警告
-  - Pandas 2.1.0 以降の警告対応 (.mapへの移行)
+アンケート解析特化型 GLMプラットフォーム (ロジスティック回帰)
+主な改善点:
+  - 二項分布（ロジスティック回帰）への固定
+  - オッズ比（Odds Ratio）の自動算出と表示
+  - 欠損値（無回答）の自動除外と警告表示
+  - アンケート向けの可視化（カテゴリ：棒グラフ割合、数値：ロジスティック曲線）
+  - 官能評価・消費者アンケート向けサンプルデータへの刷新
 """
 
 import streamlit as st
@@ -15,11 +17,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from statsmodels.tools.sm_exceptions import PerfectSeparationError
 from matplotlib import font_manager
 import io
-import itertools
 import warnings
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -31,19 +31,18 @@ warnings.filterwarnings('ignore')
 # 定数・設定
 # ==========================================
 st.set_page_config(
-    page_title="栽培試験 GLM解析プラットフォーム",
-    page_icon="🌱",
+    page_title="アンケート解析 GLMプラットフォーム",
+    page_icon="📋",
     layout="wide"
 )
 
-ALPHA = 0.05  # 有意水準を一箇所で管理
+ALPHA = 0.05  # 有意水準
 
 # ==========================================
-# 日本語フォント設定（安定化）
+# 日本語フォント設定
 # ==========================================
 @st.cache_resource
 def setup_japanese_font():
-    """日本語フォントを設定。成功したフォント名を返す。"""
     try:
         import japanize_matplotlib
         japanize_matplotlib.japanize()
@@ -71,62 +70,21 @@ FONT_STATUS = setup_japanese_font()
 # ==========================================
 # ユーティリティ関数
 # ==========================================
-
 def reset_session():
-    """セッション状態を完全リセット。"""
     keys_to_clear = [
         'analyzed', 'report_images', 'model_result',
         'report_glm', 'report_wald', 'df_eval',
-        'eval_col', 'formula', 'target_col', 'dist_type', 'factor_cols',
-        'factor_types', 'dispersion' # ★追加: 過分散パラメータもクリア
+        'eval_col', 'formula', 'target_col', 'factor_cols', 'factor_types'
     ]
     for k in keys_to_clear:
         if k in st.session_state:
             del st.session_state[k]
     st.rerun()
 
-def get_cld_letters(groups_sorted: list, tukey_df: pd.DataFrame) -> dict:
-    """Tukey検定結果から compact letter display (CLD) を生成。"""
-    required_cols = {'group1', 'group2', 'reject'}
-    if not required_cols.issubset(tukey_df.columns):
-        cols = tukey_df.columns.tolist()
-        if len(cols) >= 3:
-            tukey_df = tukey_df.copy()
-            tukey_df.columns = ['group1', 'group2'] + cols[2:]
-        else:
-            return {g: 'a' for g in groups_sorted}
-
-    ns_pairs = set()
-    for _, row in tukey_df.iterrows():
-        g1, g2 = str(row['group1']), str(row['group2'])
-        if not row['reject']:
-            ns_pairs.add((g1, g2))
-            ns_pairs.add((g2, g1))
-    for g in groups_sorted:
-        ns_pairs.add((g, g))
-
-    letters = {g: [] for g in groups_sorted}
-    letter_groups = []
-    current_idx = 0
-
-    for gi in groups_sorted:
-        absorb = [gj for gj in groups_sorted if (gi, gj) in ns_pairs]
-        matched = any(set(lg) == set(absorb) for lg in letter_groups)
-        if not matched:
-            new_letter = chr(ord('a') + current_idx)
-            current_idx += 1
-            letter_groups.append(absorb)
-            for g in absorb:
-                letters[g].append(new_letter)
-
-    return {g: ''.join(sorted(set(v))) for g, v in letters.items()}
-
 def detect_perfect_separation(df: pd.DataFrame, target_col: str, factor_col: str) -> list:
-    """カテゴリ変数における完全分離の事前検出。"""
     problems = []
     unique_vals = df[target_col].dropna().unique()
     is_binary = set(unique_vals).issubset({0, 1, 0.0, 1.0})
-
     if is_binary:
         for cat, grp in df.groupby(factor_col):
             vals = grp[target_col].dropna()
@@ -135,83 +93,57 @@ def detect_perfect_separation(df: pd.DataFrame, target_col: str, factor_col: str
     return problems
 
 def safe_numeric(series: pd.Series) -> pd.Series:
-    """安全に数値変換。変換不可は NaN。"""
     return pd.to_numeric(series, errors='coerce')
 
-def make_fig_for_category(df, factor, eval_col, target_col, groups_sorted, final_report):
-    """カテゴリ変数のBoxplot + CLD を生成。"""
-    n_groups = len(groups_sorted)
-    fig_w = max(5, 3 + n_groups * 0.8)
+def make_fig_for_category(df, factor, eval_col, target_col):
+    """アンケート向け：水準ごとの「1」の割合を棒グラフで表示"""
+    prop = df.groupby(factor)[eval_col].mean().sort_values(ascending=False)
+    counts = df.groupby(factor)[eval_col].count()
+    
+    fig_w = max(5, 3 + len(prop) * 0.8)
     fig, ax = plt.subplots(figsize=(fig_w, 4))
-
-    sns.boxplot(
-        x=factor, y=eval_col, data=df,
-        order=groups_sorted, ax=ax,
-        color='#f0f0f0', showfliers=False,
-        linewidth=1.2
-    )
-    sns.stripplot(
-        x=factor, y=eval_col, data=df,
-        order=groups_sorted, ax=ax,
-        color='black', alpha=0.55, size=4, jitter=True
-    )
-
-    for gname in groups_sorted:
-        rows = final_report[final_report[factor].astype(str) == str(gname)]
-        if rows.empty:
-            continue
-        letter = rows['cld'].values[0]
-        xpos = groups_sorted.index(gname)
-        target_data = df[df[factor].astype(str) == str(gname)][eval_col]
-        if target_data.empty:
-            continue
-        ymax = target_data.max()
-        yrange = df[eval_col].max() - df[eval_col].min()
-        offset = yrange * 0.05 if yrange > 0 else 0.02
-        ax.text(
-            xpos, ymax + offset, letter,
-            ha='center', va='bottom', fontweight='bold',
-            color='crimson', fontsize=11
-        )
-
+    
+    sns.barplot(x=prop.index, y=prop.values, ax=ax, color='#4F81BD', alpha=0.8)
+    
+    for i, p in enumerate(prop.values):
+        n_count = counts[prop.index[i]]
+        ax.text(i, p + 0.02, f"{p*100:.1f}%\n(n={n_count})", ha='center', va='bottom', fontsize=9)
+        
+    ax.set_ylim(0, max(1.0, prop.max() * 1.2)) # 上部に余裕を持たせる
     ax.set_xlabel(factor, fontsize=10)
-    ax.set_ylabel(target_col, fontsize=10)
-    ax.tick_params(axis='x', rotation=30 if n_groups > 5 else 0)
+    ax.set_ylabel(f"{target_col} の該当割合", fontsize=10)
+    ax.tick_params(axis='x', rotation=30 if len(prop) > 5 else 0)
     plt.tight_layout()
     return fig
 
-def make_fig_for_numeric(df, factor, eval_col, target_col, plot_logistic):
-    """数値変数の回帰プロットを生成。"""
+def make_fig_for_numeric(df, factor, eval_col, target_col):
+    """アンケート向け：ロジスティック曲線の描画を強制"""
     fig, ax = plt.subplots(figsize=(5, 4))
     try:
         sns.regplot(
             x=factor, y=eval_col, data=df, ax=ax,
-            scatter_kws={'alpha': 0.55, 'color': '#333333', 's': 30},
-            line_kws={'color': 'crimson', 'linewidth': 1.5},
-            logistic=plot_logistic
+            scatter_kws={'alpha': 0.3, 'color': '#333333', 's': 30, 'y_jitter': 0.05},
+            line_kws={'color': 'crimson', 'linewidth': 2},
+            logistic=True # ロジスティック曲線を強制
         )
     except Exception:
-        sns.regplot(
-            x=factor, y=eval_col, data=df, ax=ax,
-            scatter_kws={'alpha': 0.55, 'color': '#333333', 's': 30},
-            line_kws={'color': 'crimson', 'linewidth': 1.5},
-            logistic=False
-        )
+        # エラー時は通常の散布図
+        sns.scatterplot(x=factor, y=eval_col, data=df, ax=ax, alpha=0.5)
+        
     ax.set_xlabel(factor, fontsize=10)
-    ax.set_ylabel(target_col, fontsize=10)
+    ax.set_ylabel(f"{target_col} (確率)", fontsize=10)
+    ax.set_yticks([0, 0.5, 1])
     plt.tight_layout()
     return fig
 
 def fig_to_bytesio(fig) -> io.BytesIO:
-    """MatplotlibのFigureをBytesIOに変換。"""
     buf = io.BytesIO()
     fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
     buf.seek(0)
     plt.close(fig)
     return buf
 
-def generate_ai_prompt(target_col, dist_type, formula, report_glm, report_wald):
-    """LLM向けのMarkdownプロンプトを生成。"""
+def generate_ai_prompt(target_col, formula, report_glm, report_wald):
     try:
         glm_md = report_glm.reset_index().to_markdown(index=False, floatfmt='.4f')
     except Exception:
@@ -227,39 +159,32 @@ def generate_ai_prompt(target_col, dist_type, formula, report_glm, report_wald):
 
     clean_formula = formula.replace('Q(', '').replace(')', '').replace('"', '')
 
-    prompt = f"""あなたは農業統計と栽培技術の専門家です。以下の栽培試験データにおける一般化線形モデル(GLM)の解析結果を解釈し、実践的なアドバイスを提供してください。
+    prompt = f"""あなたは統計解析とマーケティング（消費者アンケート）の専門家です。以下のアンケート調査データにおけるロジスティック回帰（二項分布のGLM）の解析結果を解釈し、実践的なインサイトを提供してください。
 
 ## 解析の前提条件
-- **目的変数**: {target_col}
-- **確率分布**: {dist_type}
+- **目的変数（1=該当, 0=非該当）**: {target_col}
 - **モデル式**: `{clean_formula}`
 - **有意水準**: α = {ALPHA}
 
-## Wald検定表（要因全体の有意性）
+## Wald検定表（質問項目全体の有意性）
 {wald_md}
 
-## 回帰係数（個別水準の効果量）
+## 回帰係数とオッズ比（水準別の影響度）
 {glm_md}
 
 ## 解釈の指示
-1. **Wald検定表**から、有意な要因（Pr < {ALPHA}）とそうでない要因を区別して説明してください。
-2. **回帰係数の Estimate** の正負・大きさから、水準間の実務的な違いを具体的に説明してください。
-3. **Std.Error が異常に大きい** 項目があれば、完全分離・交絡・データ不足を疑い、その理由と対処法を述べてください。
-4. この結果を踏まえ、**現場の栽培管理または次回の試験設計**にどう活かすべきか提案してください。
+1. **Wald検定表**から、目的変数に対して有意な影響を与えている質問項目や要因を抽出してください。
+2. **オッズ比 (Odds Ratio)** に着目し、「ある水準を満たすと、そうでない場合と比べて何倍『{target_col}』になりやすいか」を具体的に解説してください。（オッズ比 > 1 は促進要因、< 1 は阻害要因）
+3. **Std.Error やオッズ比が異常に大きい** 項目があれば、回答の偏り（完全分離）や質問間の似すぎ（多重共線性）を疑い、注意を促してください。
+4. この結果を踏まえ、商品の改善や次の調査設計に向けたアクションプランを提案してください。
 """
     return prompt
 
-def generate_excel_report(target_col, dist_type, formula, report_glm, report_wald, report_images: dict) -> bytes:
-    """A4横幅対応のExcelレポートを生成。"""
+def generate_excel_report(target_col, formula, report_glm, report_wald, report_images: dict) -> bytes:
     output = io.BytesIO()
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "解析レポート"
-
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
-    ws.page_setup.fitToPage = True
-    ws.page_setup.fitToHeight = False
-    ws.page_setup.fitToWidth = 1
+    ws.title = "アンケート解析レポート"
 
     title_font   = Font(size=14, bold=True)
     head_font    = Font(bold=True, color="FFFFFF")
@@ -274,25 +199,21 @@ def generate_excel_report(target_col, dist_type, formula, report_glm, report_wal
             c.font = head_font; c.fill = head_fill; c.border = thin_bd
             c.alignment = Alignment(horizontal='center')
 
-    def write_data_cell(ws, row, col, value, bold=False, highlight=False):
+    def write_data_cell(ws, row, col, value, highlight=False):
         c = ws.cell(row=row, column=col, value=value)
         c.border = thin_bd
-        if bold: c.font = Font(bold=True)
         if highlight: c.fill = sig_fill
         return c
 
     cur = 1
-
-    ws.cell(row=cur, column=1, value="🌱 栽培試験 GLM解析レポート").font = title_font
+    ws.cell(row=cur, column=1, value="📋 アンケート解析レポート (ロジスティック回帰)").font = title_font
     cur += 2
     ws.cell(row=cur, column=1, value="【モデル設定】").font = subhead_font
     cur += 1
     ws.cell(row=cur, column=1, value=f"目的変数: {target_col}")
-    ws.cell(row=cur, column=3, value=f"確率分布: {dist_type}")
     cur += 1
     clean_f = formula.replace('Q(', '').replace(')', '').replace('"', '')
     ws.cell(row=cur, column=1, value=f"モデル式: {clean_f}")
-    ws.cell(row=cur, column=4, value=f"有意水準: α = {ALPHA}")
     cur += 2
 
     ws.cell(row=cur, column=1, value="【1. Wald検定表 (要因の有意性)】").font = subhead_font
@@ -309,28 +230,27 @@ def generate_excel_report(target_col, dist_type, formula, report_glm, report_wal
             write_data_cell(ws, cur, 4, round(float(row_data['Pr(>Chisq)']), 4) if pd.notna(row_data['Pr(>Chisq)']) else '', highlight=is_sig)
             write_data_cell(ws, cur, 5, row_data.get('Signif', ''), highlight=is_sig)
             cur += 1
-    else:
-        ws.cell(row=cur, column=1, value="（計算失敗）")
-        cur += 1
     cur += 2
 
-    ws.cell(row=cur, column=1, value="【2. 回帰係数 (Summary)】").font = subhead_font
+    ws.cell(row=cur, column=1, value="【2. 回帰係数とオッズ比】").font = subhead_font
     cur += 1
-    headers_g = ["要因 / 水準", "Estimate", "Std.Error", "z value", "Pr(>|z|)", "有意"]
+    headers_g = ["要因 / 水準", "Estimate", "Odds Ratio", "Std.Error", "z value", "Pr(>|z|)", "有意"]
     write_header_row(ws, cur, headers_g)
     cur += 1
     for str_idx, row_data in report_glm.iterrows():
         is_sig = float(row_data['Pr(>|z|)']) < ALPHA if pd.notna(row_data['Pr(>|z|)']) else False
         write_data_cell(ws, cur, 1, str(str_idx), highlight=is_sig)
-        for ci, col_name in enumerate(['Estimate', 'Std.Error', 'z value', 'Pr(>|z|)'], 2):
-            val = row_data[col_name]
-            write_data_cell(ws, cur, ci, round(float(val), 4) if pd.notna(val) else '', highlight=is_sig)
-        write_data_cell(ws, cur, 6, row_data.get('Signif', '') if not pd.isna(row_data['Std.Error']) and row_data['Std.Error'] <= 10 else '⚠️SE過大', highlight=is_sig)
+        write_data_cell(ws, cur, 2, round(float(row_data['Estimate']), 4) if pd.notna(row_data['Estimate']) else '', highlight=is_sig)
+        write_data_cell(ws, cur, 3, round(float(row_data['Odds Ratio']), 4) if pd.notna(row_data['Odds Ratio']) else '', highlight=is_sig)
+        write_data_cell(ws, cur, 4, round(float(row_data['Std.Error']), 4) if pd.notna(row_data['Std.Error']) else '', highlight=is_sig)
+        write_data_cell(ws, cur, 5, round(float(row_data['z value']), 3) if pd.notna(row_data['z value']) else '', highlight=is_sig)
+        write_data_cell(ws, cur, 6, round(float(row_data['Pr(>|z|)']), 4) if pd.notna(row_data['Pr(>|z|)']) else '', highlight=is_sig)
+        write_data_cell(ws, cur, 7, row_data.get('Signif', '') if not pd.isna(row_data['Std.Error']) and row_data['Std.Error'] <= 10 else '⚠️SE過大', highlight=is_sig)
         cur += 1
     cur += 3
 
     if report_images:
-        ws.cell(row=cur, column=1, value="【3. 要因別の影響グラフ】").font = subhead_font
+        ws.cell(row=cur, column=1, value="【3. 項目別の影響グラフ】").font = subhead_font
         cur += 2
         for factor_name, img_buf in report_images.items():
             ws.cell(row=cur, column=1, value=f"▶ {factor_name}").font = Font(bold=True)
@@ -348,8 +268,7 @@ def generate_excel_report(target_col, dist_type, formula, report_glm, report_wal
             cur += rows_to_skip
 
     ws.column_dimensions['A'].width = 35
-    for col_letter in ['B', 'C', 'D', 'E', 'F']: ws.column_dimensions[col_letter].width = 14
-
+    for col_letter in ['B', 'C', 'D', 'E', 'F', 'G']: ws.column_dimensions[col_letter].width = 14
     wb.save(output)
     return output.getvalue()
 
@@ -357,8 +276,8 @@ def generate_excel_report(target_col, dist_type, formula, report_glm, report_wal
 # ==========================================
 # アプリ本体
 # ==========================================
-st.title("📈 栽培試験データ GLM解析アプリ")
-st.markdown("確率分布・質的/量的変数の組み合わせに対応した **一般化線形モデル (GLM)** による解析プラットフォームです。")
+st.title("📋 アンケートデータ GLM解析アプリ")
+st.markdown("質問項目（質的/量的データ）から「はい/いいえ」「購入する/しない」といった2値の要因を解析する、**ロジスティック回帰（二項分布）**特化型アプリです。")
 
 if FONT_STATUS == "fallback":
     st.warning("⚠️ 日本語フォントが見つかりませんでした。文字化けする場合は `pip install japanize-matplotlib` を実行してください。")
@@ -369,21 +288,19 @@ with st.sidebar:
         reset_session()
     st.divider()
     st.caption(f"有意水準: α = {ALPHA}")
-    st.caption("GLM engine: statsmodels")
 
 # ==========================================
-# Step 1: データ読み込み (★修正: ファイルアップロード対応)
+# Step 1: データ読み込み
 # ==========================================
 st.header("1. データの読み込み")
 data_source = st.radio(
     "入力方法を選択：",
-    ["📄 ファイルアップロード", "📋 Excelデータを貼り付け", "🥔 サンプルデータで試す"],
+    ["📄 ファイルアップロード", "📋 Excelデータを貼り付け", "📊 官能評価サンプルで試す"],
     horizontal=True
 )
 df_raw = None
 
 if data_source == "📄 ファイルアップロード":
-    # ★追加: st.file_uploaderの利用
     uploaded_file = st.file_uploader("CSV または Excelファイルをアップロードしてください", type=["csv", "xlsx"])
     if uploaded_file is not None:
         try:
@@ -391,7 +308,6 @@ if data_source == "📄 ファイルアップロード":
                 try:
                     df_raw = pd.read_csv(uploaded_file)
                 except UnicodeDecodeError:
-                    # Shift-JISでの読み込みを試行 (Excel出力のCSV対策)
                     uploaded_file.seek(0)
                     df_raw = pd.read_csv(uploaded_file, encoding='shift_jis')
             else:
@@ -400,19 +316,26 @@ if data_source == "📄 ファイルアップロード":
         except Exception as e:
             st.error(f"❌ 読み込みエラー: {e}")
 
-elif data_source == "🥔 サンプルデータで試す":
+elif data_source == "📊 官能評価サンプルで試す":
+    # アンケート向けのダミーデータ生成
     rng = np.random.default_rng(42)
     rows = []
-    for rep, v, w in itertools.product(range(1, 6), ['シマアカリ', 'ニシユタカ', 'アイユタカ'], [10, 20, 30]):
-        base_p = 0.5
-        if v == 'シマアカリ': base_p += 0.2
-        if w == 30: base_p += 0.15
-        elif w == 10: base_p -= 0.2
-        prob = float(np.clip(rng.normal(base_p, 0.1), 0.05, 0.95))
-        total = 20
-        sprouted = int(rng.binomial(total, prob))
-        rows.append([rep, v, w, total, sprouted, sprouted / total])
-    df_raw = pd.DataFrame(rows, columns=['rep', 'var', 'water_ml', 'total', 'sprouted', 'rate'])
+    for _ in range(250):
+        var = rng.choice(['シマアカリ', 'ニシユタカ', 'アイユタカ'])
+        age = rng.choice(['20代', '30代', '40代', '50代以上'], p=[0.2, 0.3, 0.3, 0.2])
+        texture = rng.integers(1, 6) # 1〜5の評価
+        sweetness = rng.integers(1, 6)
+        
+        # ロジスティック回帰の背後にある確率を生成
+        base_logit = -3.0 + 0.8 * texture + 0.5 * sweetness
+        if var == 'シマアカリ': base_logit += 1.2
+        if age == '20代': base_logit -= 0.8
+        
+        prob = 1 / (1 + np.exp(-base_logit))
+        purchase = rng.binomial(1, prob)
+        rows.append([var, age, texture, sweetness, purchase])
+        
+    df_raw = pd.DataFrame(rows, columns=['試食品種', '回答者年代', '食感評価(1-5)', '甘み評価(1-5)', '購入意向(1=買う)'])
     st.success("✅ サンプルデータを読み込みました。")
 
 else:
@@ -440,142 +363,87 @@ if df_raw is None:
     st.stop()
 
 # ==========================================
-# Step 2: データの絞り込み
+# Step 2 & 3: データの確認
 # ==========================================
-st.header("2. データの絞り込み（層別解析）")
-df_target = df_raw.copy()
-filter_cols = st.multiselect("絞り込みに使用する列を選択（複数可）:", df_raw.columns.tolist())
-if filter_cols:
-    filter_columns = st.columns(min(len(filter_cols), 3))
-    for i, col in enumerate(filter_cols):
-        with filter_columns[i % 3]:
-            unique_vals = df_raw[col].dropna().unique().tolist()
-            selected_vals = st.multiselect(f"【{col}】", unique_vals, default=unique_vals, key=f"filter_{col}")
-            df_target = df_target[df_target[col].isin(selected_vals)]
-
-st.info(f"📊 解析対象: **{len(df_target)} 件** （元データ: {len(df_raw)} 件）")
-if df_target.empty:
-    st.error("⚠️ 絞り込みの結果がゼロ件です。")
-    st.stop()
-
-st.divider()
-
-# ==========================================
-# Step 3: データの要約と交絡チェック
-# ==========================================
-st.header("3. データの要約と交絡チェック")
+st.header("2. データの確認")
 col_s1, col_s2 = st.columns(2)
 with col_s1:
     st.markdown("**データプレビュー**")
-    st.dataframe(df_target.head(5), use_container_width=True)
+    st.dataframe(df_raw.head(5), use_container_width=True)
 with col_s2:
     st.markdown("**要約統計量**")
-    st.dataframe(df_target.describe(), use_container_width=True)
-
-st.subheader("📊 交絡チェック（クロス集計）")
-cols = df_target.columns.tolist()
-cat_cols = [c for c in cols if df_target[c].dtype == object or df_target[c].nunique() < 20]
-
-col_c1, col_c2 = st.columns(2)
-with col_c1: cross_var1 = st.selectbox("行変数", ["---"] + cat_cols)
-with col_c2: cross_var2 = st.selectbox("列変数", ["---"] + cat_cols)
-
-if cross_var1 != "---" and cross_var2 != "---" and cross_var1 != cross_var2:
-    try:
-        ct = pd.crosstab(df_target[cross_var1], df_target[cross_var2])
-        st.dataframe(ct, use_container_width=True)
-        if (ct == 0).sum().sum() > 0:
-            st.warning("⚠️ ゼロセルが存在します。完全分離エラーに注意してください。")
-    except Exception as e:
-        st.error(f"クロス集計エラー: {e}")
+    st.dataframe(df_raw.describe(), use_container_width=True)
 
 st.divider()
 
 # ==========================================
 # Step 4: モデル設定
 # ==========================================
-st.header("4. モデル設定")
-col_m1, col_m2 = st.columns(2)
-numeric_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df_target[c])]
+st.header("3. モデル設定")
+cols = df_raw.columns.tolist()
+numeric_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df_raw[c])]
 
+col_m1, col_m2 = st.columns(2)
 with col_m1:
-    target_col = st.selectbox("目的変数（応答変数）", numeric_cols)
-    dist_type = st.selectbox("確率分布 (family)", [
-        "二項分布 (Binomial / 発生数・0/1)",
-        "ポアソン分布 (Poisson / カウントデータ)",
-        "正規分布 (Gaussian / 連続値)"
-    ])
-    b_fmt, total_col = None, None
-    if "二項分布" in dist_type:
-        b_fmt = st.radio("データ形式", ["発生数 と 調査数 (集計データ)", "0, 1 データ (個体ごと)", "割合 (0〜1)"], horizontal=True)
-        if b_fmt == "発生数 と 調査数 (集計データ)":
-            total_col = st.selectbox("「調査数 (母数)」の列", [c for c in numeric_cols if c != target_col])
+    st.markdown("**目的変数（回答結果）**")
+    target_col = st.selectbox("「はい/いいえ」「1/0」を示す列を選択", numeric_cols)
+    st.info("💡 分析手法は自動的に**二項分布（ロジスティック回帰）**に設定されます。")
 
 with col_m2:
+    st.markdown("**要因（質問項目・回答者属性）**")
     all_factor_candidates = [c for c in cols if c != target_col]
-    safe_defaults = [c for c in all_factor_candidates if c.lower() not in ('rep', '反復', '繰り返し') and df_target[c].nunique() < len(df_target) * 0.9][:3]
-    factor_cols = st.multiselect("要因（説明変数）", all_factor_candidates, default=safe_defaults)
+    factor_cols = st.multiselect("分析に含める要因列を選択", all_factor_candidates, default=all_factor_candidates[:3])
 
 factor_types = {}
 if factor_cols:
     st.markdown("**各要因のデータ型：**")
     for f in factor_cols:
-        is_text = df_target[f].dtype == object
-        default_type = "カテゴリ (質的変数)" if is_text or df_target[f].nunique() <= 10 else "数値 (連続量)"
-        factor_types[f] = st.radio(f"【{f}】", ["カテゴリ (質的変数)", "数値 (連続量)"], index=0 if "カテゴリ" in default_type else 1, horizontal=True, key=f"type_{f}")
+        is_text = df_raw[f].dtype == object
+        default_type = "カテゴリ (属性や選択肢)" if is_text or df_raw[f].nunique() <= 10 else "数値 (スコアや年齢)"
+        factor_types[f] = st.radio(f"【{f}】", ["カテゴリ (属性や選択肢)", "数値 (スコアや年齢)"], index=0 if "カテゴリ" in default_type else 1, horizontal=True, key=f"type_{f}")
 
-run_button = st.button("🚀 GLMを実行", type="primary", disabled=(len(factor_cols) == 0))
+run_button = st.button("🚀 ロジスティック回帰を実行", type="primary", disabled=(len(factor_cols) == 0))
 
 # ==========================================
 # Step 5: GLM実行
 # ==========================================
 if run_button and factor_cols and target_col:
-    for k in ['report_images', 'model_result', 'report_glm', 'report_wald', 'df_eval', 'eval_col', 'formula', 'ai_prompt', 'excel_data', 'dispersion']:
+    # 古いキャッシュをクリア
+    for k in ['report_images', 'model_result', 'report_glm', 'report_wald', 'df_eval', 'eval_col', 'formula', 'excel_data']:
         if k in st.session_state: del st.session_state[k]
 
     st.divider()
-    st.header("5. 一般化線形モデルのあてはめ結果")
+    st.header("4. 解析結果")
 
-    df_eval = df_target.copy()
+    # データの前処理と欠損値ハンドリング
+    df_eval = df_raw.copy()
+    n_before = len(df_eval)
     df_eval[target_col] = safe_numeric(df_eval[target_col])
+    
+    # 欠損値（無回答）を含む行を削除（リストワイズ除去）
     df_eval = df_eval.dropna(subset=[target_col] + factor_cols)
+    n_after = len(df_eval)
+    if n_after < n_before:
+        st.warning(f"⚠️ 欠損値（無回答）を含むデータを **{n_before - n_after} 件** 除外しました。解析対象: {n_after} 件。")
 
     if df_eval.empty: st.error("⚠️ データが0件になりました。"); st.stop()
 
-    eval_col = f"{target_col}__ModelVal"
-    model_weights = None
+    eval_col = f"{target_col}_bin"
+    # 二値データ(0,1)へのクリッピング
+    df_eval[eval_col] = np.clip(df_eval[target_col], 0, 1)
 
-    if "二項分布" in dist_type:
-        family = sm.families.Binomial()
-        if b_fmt == "0, 1 データ (個体ごと)":
-            df_eval[eval_col] = np.clip(df_eval[target_col], 0, 1)
-        elif b_fmt == "発生数 と 調査数 (集計データ)":
-            df_eval = df_eval.dropna(subset=[total_col])
-            df_eval[total_col] = safe_numeric(df_eval[total_col])
-            df_eval = df_eval[df_eval[total_col] > 0]
-            if df_eval.empty: st.error("⚠️ 調査数が0または欠損のためデータが0件になりました。"); st.stop()
-            df_eval[eval_col] = df_eval[target_col] / df_eval[total_col]
-            model_weights = df_eval[total_col]
-        elif b_fmt == "割合 (0〜1)":
-            max_val = df_eval[target_col].max() if not df_eval.empty else 0
-            df_eval[eval_col] = np.clip(df_eval[target_col] / 100.0 if max_val > 1.5 else df_eval[target_col], 0.0, 1.0)
-    elif "ポアソン分布" in dist_type:
-        family = sm.families.Poisson()
-        df_eval[eval_col] = df_eval[target_col].round().astype(int)
-    else:
-        family = sm.families.Gaussian()
-        df_eval[eval_col] = df_eval[target_col]
-
+    # 完全分離の事前チェック
     sep_warnings = []
     for f in factor_cols:
         if "カテゴリ" in factor_types[f]:
             prob_cats = detect_perfect_separation(df_eval, eval_col, f)
             if prob_cats:
-                sep_warnings.append(f"**{f}**: カテゴリ {', '.join(prob_cats)} で応答値が均一 → 完全分離の可能性")
+                sep_warnings.append(f"**{f}**: 選択肢「{', '.join(prob_cats)}」で回答が全員一致しています（完全分離）。結果の信頼性が落ちる可能性があります。")
     if sep_warnings:
-        with st.expander("⚠️ 完全分離の可能性（事前チェック）", expanded=True):
+        with st.expander("⚠️ データ偏りの警告（完全分離）", expanded=True):
             for w in sep_warnings: st.warning(w)
 
+    # モデル式の構築
     formula_terms = []
     for f in factor_cols:
         if "カテゴリ" in factor_types[f]:
@@ -585,42 +453,32 @@ if run_button and factor_cols and target_col:
             df_eval[f] = safe_numeric(df_eval[f])
             formula_terms.append(f'Q("{f}")')
 
-    df_eval = df_eval.dropna(subset=factor_cols)
     formula = f'Q("{eval_col}") ~ ' + ' + '.join(formula_terms)
 
     try:
-        with st.spinner("GLMを計算中..."):
-            try:
-                if model_weights is not None:
-                    model = smf.glm(formula, data=df_eval, family=family, var_weights=model_weights).fit()
-                else:
-                    model = smf.glm(formula, data=df_eval, family=family).fit()
-            except PerfectSeparationError:
-                st.error("❌ **完全分離エラー**\n\n特定のカテゴリで応答が完全に0または1に偏っています。")
-                st.stop()
-            except Exception as fit_e:
-                st.error(f"❌ モデル計算エラー: {fit_e}")
-                st.stop()
+        with st.spinner("モデルを計算中..."):
+            # ロジスティック回帰の実行
+            family = sm.families.Binomial(link=sm.families.links.logit())
+            model = smf.glm(formula, data=df_eval, family=family).fit()
 
         if model.df_resid <= 0:
-            st.error("❌ 残差自由度が0以下です。パラメータ数がデータ数を超えています。")
+            st.error("❌ データ数に対して要因の数が多すぎます。")
             st.stop()
 
-        # ★追加: 過分散パラメータ(Overdispersion)の計算
-        dispersion = None
-        if "ポアソン分布" in dist_type or ("二項分布" in dist_type and b_fmt == "発生数 と 調査数 (集計データ)"):
-            if model.df_resid > 0:
-                dispersion = model.pearson_chi2 / model.df_resid
-
+        # サマリーテーブルの作成
         report_glm = pd.DataFrame({
             'Estimate':  model.params,
             'Std.Error': model.bse,
             'z value':   model.tvalues,
             'Pr(>|z|)':  model.pvalues
         })
+        # ★オッズ比の計算を追加
+        report_glm.insert(1, 'Odds Ratio', np.exp(report_glm['Estimate']))
+        
         report_glm['Signif'] = report_glm['Pr(>|z|)'].apply(lambda p: "**" if p < 0.01 else ("*" if p < ALPHA else "n.s."))
         report_glm['Note'] = report_glm['Std.Error'].apply(lambda se: "⚠️SE過大" if pd.notna(se) and se > 10 else "")
 
+        # Wald検定表の作成
         report_wald = None
         try:
             wald_res = model.wald_test_terms().table
@@ -638,14 +496,15 @@ if run_button and factor_cols and target_col:
         st.session_state['eval_col']    = eval_col
         st.session_state['formula']     = formula
         st.session_state['target_col']  = target_col
-        st.session_state['dist_type']   = dist_type
         st.session_state['factor_cols'] = factor_cols
         st.session_state['factor_types']= factor_types
-        st.session_state['dispersion']  = dispersion # ★追加
         st.session_state['analyzed']    = True
 
+    except PerfectSeparationError:
+        st.error("❌ **完全分離エラー**\n\n特定の回答者グループで結果が完全に偏っています。要因を減らしてください。")
+        st.stop()
     except Exception as e:
-        st.error(f"❌ 予期せぬエラー: {e}")
+        st.error(f"❌ モデル計算エラー: {e}")
         st.stop()
 
 
@@ -660,54 +519,32 @@ if st.session_state.get('analyzed'):
     eval_col     = st.session_state['eval_col']
     formula      = st.session_state['formula']
     target_col   = st.session_state['target_col']
-    dist_type    = st.session_state['dist_type']
     factor_cols  = st.session_state['factor_cols']
     factor_types = st.session_state['factor_types']
-    dispersion   = st.session_state.get('dispersion') # ★追加
 
-    tab_res, tab_ai = st.tabs(["📊 解析サマリー", "🤖 AI解析用プロンプト生成"])
+    tab_res, tab_ai = st.tabs(["📊 解析サマリー", "🤖 AI解析用プロンプト"])
 
     with tab_res:
-        st.code(f"モデル式: {formula.replace('Q(', '').replace(')', '').replace(chr(34), '')}", language="r")
+        st.markdown("""
+        **💡 読み方のポイント**
+        * **オッズ比 (Odds Ratio)**: `1.0` を基準とします。`1.5`なら「該当しやすさが1.5倍に上がる」、`0.5`なら「該当しやすさが半分に下がる」と解釈できます。
+        """)
         
-        # ★追加: 過分散の警告表示
-        if dispersion is not None:
-            st.markdown(f"**💡 過分散パラメータ (Pearson χ² / df): {dispersion:.2f}**")
-            if dispersion > 1.5:
-                st.warning(
-                    "⚠️ **過分散の可能性があります。** データのばらつきが想定より大きくなっています。\n"
-                    "そのまま解釈すると「有意差が出やすくなる（第1種の過誤）」リスクがあるため、"
-                    "解釈に注意するか、別の分布（負の二項分布など）への変更を検討してください。"
-                )
-            elif dispersion < 0.5:
-                st.info("ℹ️ 過小分散の傾向があります。")
-        
-        col_r1, col_r2 = st.columns(2)
+        col_r1, col_r2 = st.columns([3, 2])
         with col_r1:
-            st.markdown("**■ 回帰係数 (summary)**")
-            
-            # ★修正: Pandas >= 2.1.0 対応のため applymap -> map へ変更
-            # 念のため古いバージョンも考慮して try-except を記述
+            st.markdown("**■ 回帰係数とオッズ比**")
             styled_df = report_glm.style.format({
-                'Estimate': '{:.4f}', 'Std.Error': '{:.4f}',
+                'Estimate': '{:.4f}', 'Odds Ratio': '{:.3f}', 'Std.Error': '{:.4f}',
                 'z value': '{:.3f}', 'Pr(>|z|)': '{:.4f}'
             })
-            
             try:
-                styled_df = styled_df.map(
-                    lambda v: 'background-color: #fff3cd' if '⚠️' in str(v) else '',
-                    subset=['Note']
-                )
+                styled_df = styled_df.map(lambda v: 'background-color: #fff3cd' if '⚠️' in str(v) else '', subset=['Note'])
             except AttributeError:
-                styled_df = styled_df.applymap(
-                    lambda v: 'background-color: #fff3cd' if '⚠️' in str(v) else '',
-                    subset=['Note']
-                )
-                
+                styled_df = styled_df.applymap(lambda v: 'background-color: #fff3cd' if '⚠️' in str(v) else '', subset=['Note'])
             st.dataframe(styled_df, use_container_width=True)
 
         with col_r2:
-            st.markdown("**■ Wald検定表 (anova Chisq)**")
+            st.markdown("**■ Wald検定表 (質問項目全体の有意差)**")
             if report_wald is not None:
                 st.dataframe(
                     report_wald.style.format({
@@ -716,97 +553,50 @@ if st.session_state.get('analyzed'):
                     use_container_width=True
                 )
             else:
-                st.info("Wald検定の計算に失敗しました。")
+                st.info("計算失敗")
 
     with tab_ai:
         st.markdown("### AIへの解析指示プロンプト")
-        st.caption("このテキストを ChatGPT / Gemini / Claude などに貼り付けてください。")
-        ai_prompt = generate_ai_prompt(target_col, dist_type, formula, report_glm, report_wald)
-        
-        # ★追加: 過分散情報をプロンプトにも補足
-        if dispersion is not None and dispersion > 1.5:
-            ai_prompt += f"\n5. **過分散 (Overdispersion) について**: 過分散パラメータが {dispersion:.2f} と高くなっています。この点に関する統計的注意点も付記してください。\n"
-            
-        st.text_area("📋 プロンプトをコピー", value=ai_prompt, height=420)
+        st.caption("ChatGPTなどに貼り付けて、解釈を手伝ってもらえます。")
+        ai_prompt = generate_ai_prompt(target_col, formula, report_glm, report_wald)
+        st.text_area("📋 プロンプトをコピー", value=ai_prompt, height=300)
 
     st.divider()
 
-    st.header("6. 各要因の影響と可視化")
+    st.header("5. 質問項目別の影響グラフ")
     if 'report_images' not in st.session_state:
         st.session_state['report_images'] = {}
 
     for factor in factor_cols:
-        if factor.lower() in ('rep', '反復', '繰り返し', 'block', 'blk'):
-            continue
-
         is_cat = "カテゴリ" in factor_types[factor]
-        st.subheader(f"▶ {factor}  ({'質的変数' if is_cat else '量的変数'})")
+        st.subheader(f"▶ {factor} {'(選択肢)' if is_cat else '(スコア・数値)'}")
 
-        if is_cat:
-            summary_stats = (
-                df_eval.groupby(factor)[eval_col]
-                .agg(['count', 'mean', 'std'])
-                .reset_index()
-                .rename(columns={'count': 'N', 'mean': 'Mean (解析値)', 'std': 'SD'})
-            )
-            
-            # ★追加: Tukeyの計算前エラー回避ロジック
-            unique_groups = df_eval[factor].nunique()
-            if unique_groups < 2:
-                st.warning(f"「{factor}」は水準が1つしかないため、多重比較をスキップします。")
-                st.dataframe(summary_stats.style.format(precision=3), use_container_width=True)
-                continue
-
-            try:
-                tukey_obj = pairwise_tukeyhsd(endog=df_eval[eval_col], groups=df_eval[factor].astype(str), alpha=ALPHA)
-                tukey_df = pd.DataFrame(data=tukey_obj._results_table.data[1:], columns=tukey_obj._results_table.data[0])
-                tukey_df.columns = [str(c) for c in tukey_df.columns]
-
-                means_sorted = df_eval.groupby(factor)[eval_col].mean().sort_values(ascending=False)
-                groups_sorted = means_sorted.index.astype(str).tolist()
-                cld_map = get_cld_letters(groups_sorted, tukey_df)
-
-                letters_df = pd.DataFrame({factor: list(cld_map.keys()), 'cld': list(cld_map.values())})
-                summary_stats[factor] = summary_stats[factor].astype(str)
-                final_report = pd.merge(summary_stats, letters_df, on=factor).sort_values('Mean (解析値)', ascending=False).reset_index(drop=True)
-
-                col_tk1, col_tk2 = st.columns([2, 3])
-                with col_tk1:
-                    st.markdown(f"**Tukeyの多重比較 (α={ALPHA})**")
-                    st.dataframe(final_report.style.format(precision=3), use_container_width=True)
-                with col_tk2:
-                    fig = make_fig_for_category(df_eval, factor, eval_col, target_col, groups_sorted, final_report)
-                    st.pyplot(fig)
-                    st.session_state['report_images'][factor] = fig_to_bytesio(fig)
-
-            except Exception as e:
-                st.warning(f"多重比較の計算ができませんでした: {e}")
-                st.dataframe(summary_stats.style.format(precision=3), use_container_width=True)
-
-        else:
-            col_n1, col_n2 = st.columns([2, 3])
-            with col_n1:
-                st.markdown("**変数の要約**")
+        col_n1, col_n2 = st.columns([2, 3])
+        with col_n1:
+            if is_cat:
+                summary_stats = df_eval.groupby(factor)[eval_col].agg(['count', 'mean']).reset_index()
+                summary_stats.columns = [factor, '回答数(N)', '該当割合(%)']
+                summary_stats['該当割合(%)'] = (summary_stats['該当割合(%)'] * 100).round(1)
+                st.dataframe(summary_stats, use_container_width=True)
+            else:
                 st.dataframe(df_eval[factor].describe(), use_container_width=True)
-            with col_n2:
-                plot_logistic = False
-                if "二項分布" in dist_type:
-                    unique_vals_set = set(df_eval[eval_col].dropna().unique())
-                    if unique_vals_set.issubset({0, 1, 0.0, 1.0}):
-                        plot_logistic = True
-
-                fig = make_fig_for_numeric(df_eval, factor, eval_col, target_col, plot_logistic)
-                st.pyplot(fig)
-                st.session_state['report_images'][factor] = fig_to_bytesio(fig)
+                
+        with col_n2:
+            if is_cat:
+                fig = make_fig_for_category(df_eval, factor, eval_col, target_col)
+            else:
+                fig = make_fig_for_numeric(df_eval, factor, eval_col, target_col)
+            st.pyplot(fig)
+            st.session_state['report_images'][factor] = fig_to_bytesio(fig)
 
     st.divider()
 
-    st.header("7. 解析レポートのダウンロード (A4印刷対応)")
+    st.header("6. 解析レポートのダウンロード")
     if 'excel_data' not in st.session_state:
         with st.spinner("Excelレポートを生成中..."):
             try:
                 st.session_state['excel_data'] = generate_excel_report(
-                    target_col, dist_type, formula, report_glm, report_wald, st.session_state.get('report_images', {})
+                    target_col, formula, report_glm, report_wald, st.session_state.get('report_images', {})
                 )
             except Exception as e:
                 st.error(f"Excelレポート生成エラー: {e}")
@@ -816,9 +606,7 @@ if st.session_state.get('analyzed'):
         st.download_button(
             label="📥 解析レポート（図入りExcel）をダウンロード",
             data=st.session_state['excel_data'],
-            file_name="GLM_Analysis_Report.xlsx",
+            file_name="Questionnaire_GLM_Report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
-    else:
-        st.info("Excelレポートの生成に失敗しました。解析を再実行してください。")
